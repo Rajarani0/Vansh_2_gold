@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>XAUUSD NUCLEAR SMC vC (Gold)</title>
+  <style>
+    :root { --bg:#0b0c0f; --card:#111216; --accent:#06f; --good:#063; --bad:#600; --muted:#9aa; color-scheme: dark; }
+    body{ background:var(--bg); color:#fff; font-family:Inter, system-ui, Arial; padding:20px; margin:0; }
+    .wrap{ max-width:900px; margin:0 auto; }
+    h1{ margin:0 0 8px 0; font-size:20px; }
+    p.small{ color:var(--muted); margin:6px 0 16px 0; }
+    label{ font-size:13px; color:var(--muted); display:block; margin-top:8px; }
+    input{ width:100%; padding:10px; border-radius:8px; border:1px solid #222; background:var(--card); color:#fff; margin-top:6px; }
+    button{ padding:10px 14px; border-radius:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; margin:8px 6px 8px 0; }
+    button.stop{ background:#c33; }
+    .status{ padding:10px; background:#0d0f12; border-radius:8px; margin-top:12px; }
+    .signalBox{ padding:12px; margin-top:12px; border-radius:8px; display:none; color:white; font-weight:600; }
+    .logs{ background:#000; color:#0f0; padding:10px; height:350px; overflow:auto; border-radius:6px; margin-top:12px; font-family:monospace; white-space:pre-wrap; }
+    .infoRow{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    .chip{ background:#0d0f12; padding:6px 10px; border-radius:8px; color:var(--muted); font-size:13px; }
+    .trendRow{ margin-top:8px; display:flex; gap:10px; align-items:center; }
+    .trendChip{ padding:6px 10px; border-radius:8px; font-weight:600; background:#222; color:var(--muted); }
+    small{ color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>XAUUSD NUCLEAR SMC vC</h1>
+  <p class="small">Refined SMC + Liquidity Grab + MSS + Volume. 8 indicators → 5/8 Early Signal → 6+ Strong Signal.</p>
+
+  <label>Twelve Data API Key (Free)</label>
+  <input id="td_key" placeholder="your_twelve_data_api_key" type="password">
+
+  <label>Telegram Bot Token</label>
+  <input id="tg_token" placeholder="123456:ABC...">
+
+  <label>Chat IDs (comma separated)</label>
+  <input id="tg_chats" placeholder="12345678,-1001234567890">
+
+  <div class="infoRow">
+    <button id="startBtn">Start Bot</button>
+    <button id="stopBtn" class="stop">Stop Bot</button>
+    <div class="chip" id="runStatus">Status: Stopped</div>
+    <div class="chip" id="lastSignal">Last Signal: —</div>
+  </div>
+
+  <div class="trendRow">
+    <div class="trendChip" id="trendChip">Trend: —</div>
+    <div class="trendChip" id="strengthChip">Strength: —</div>
+  </div>
+
+  <div id="signal" class="signalBox"></div>
+
+  <div class="status" id="summary">Config: XAUUSD • 15m/1h/4h • 1-min scheduler • TwelveData Free</div>
+
+  <div class="logs" id="logs"></div>
+</div>
+
+<script>
+/* ------------------------------
+      XAUUSD NUCLEAR SMC vC - TwelveData Free API
+   ------------------------------ */
+
+const SYMBOL = "XAU/USD";
+const SCAN_MS = 60 * 1000;
+const COOLDOWN_MS = 60 * 60 * 1000;
+const LOOKBACK_M15 = 200;
+const LOOKBACK_1H = 200;
+const LOOKBACK_4H = 120;
+const VOLUME_MULT = 2.2;
+const WICK_ATR_MULT = 1.1;
+const ATR_INCREASE_MULT = 1.15;
+const MSS_LOOKBACK = 30;
+const RR = 4;
+
+let loopId = null;
+let running = false;
+let lastSignalTime = 0;
+
+const logsEl = document.getElementById('logs');
+const statusEl = document.getElementById('runStatus');
+const lastSignalEl = document.getElementById('lastSignal');
+const signalBox = document.getElementById('signal');
+const trendChip = document.getElementById('trendChip');
+const strengthChip = document.getElementById('strengthChip');
+
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  logsEl.innerText += `[\( {t}] \){msg}\n`;
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+function fmt(n,d=2){ return Number(n).toFixed(d); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// Twelve Data Free API
+async function getKlines(interval, limit){
+  const key = document.getElementById('td_key').value.trim();
+  if(!key || key.length < 10){
+    log('Twelve Data API Key missing!');
+    log('Get free key: https://twelvedata.com/apikey');
+    return [];
+  }
+
+  const intervalMap = { '15m': '15min', '1h': '1h', '4h': '4h' };
+  const tdInt = intervalMap[interval] || interval;
+
+  const url = `https://api.twelvedata.com/time_series?symbol=\( {encodeURIComponent(SYMBOL)}&interval= \){tdInt}&outputsize=\( {limit}&apikey= \){key}&dp=4`;
+
+  try{
+    const r = await fetch(url);
+    if(!r.ok){
+      log(`TwelveData Error: ${r.status}`);
+      return [];
+    }
+    const j = await r.json();
+    if(j.status === 'error'){
+      log('TwelveData: ' + j.message);
+      if(j.message.includes('limit')) log('Free plan limit reached. Wait 1 hour.');
+      return [];
+    }
+    if(!j.values || j.values.length === 0) return [];
+
+    log(`Fetched \( {j.values.length} \){tdInt} candles`);
+    return j.values.map(c => ({
+      t: Date.parse(c.datetime + ' GMT'),
+      o: +c.open,
+      h: +c.high,
+      l: +c.low,
+      c: +c.close,
+      v: +c.volume || 0
+    })).reverse(); // oldest first
+  }catch(e){
+    log('Fetch failed: ' + e.message);
+    return [];
+  }
+}
+
+/* Tumhara original BTC wala pura logic - 100% unchanged */
+function ATR(candles, period=14){ if(!candles || candles.length < period+1) return 0; const trs = []; for(let i=1;i<candles.length;i++){ const cur = candles[i], prev = candles[i-1]; trs.push(Math.max(cur.h - cur.l, Math.abs(cur.h - prev.c), Math.abs(cur.l - prev.c))); } let atr = trs.slice(0,period).reduce((a,b)=>a+b,0) / period; for(let i=period;i<trs.length;i++){ atr = (atr*(period-1) + trs[i]) / period; } return atr; }
+function SMA_of_ATR_series(candles, atrPeriod=14, smaPeriod=20){ if(!candles || candles.length < atrPeriod + smaPeriod) return 0; const atrs = []; for(let start=0; start <= candles.length - atrPeriod - 1; start++){ const slice = candles.slice(start, start + atrPeriod + 1); atrs.push(ATR(slice, atrPeriod)); } const lastSMAPeriod = atrs.slice(-smaPeriod); return lastSMAPeriod.reduce((a,b)=>a+b,0)/lastSMAPeriod.length; }
+function detectOB(c){ let bull=null, bear=null; for(let i=3;i<c.length-2;i++){ const p = c[i-1], x = c[i]; if(p.c < p.o && x.c > x.o && x.c > p.h && x.l <= p.l) bull = { price: p.l, idx: i-1 }; if(p.c > p.o && x.c < x.o && x.c < p.l && x.h >= p.h) bear = { price: p.h, idx: i-1 }; } return { bull, bear }; }
+function detectFVG(c){ for(let i=2;i<c.length;i++){ const a=c[i-2], x=c[i]; if(a.h < x.l) return 'bull'; if(a.l > x.h) return 'bear'; } return null; }
+function isVolumeSpike(c, mult=VOLUME_MULT){ if(!c || c.length < 12) return false; const last = c[c.length-1].v; const avg = c.slice(-11,-1).reduce((s,it)=>s+it.v,0) / 10; return last > avg * mult; }
+function trendBiasFrom4h(h4){ if(!h4 || h4.length < 21) return 'neutral'; const closes = h4.map(c=>c.c); const sma20 = closes.slice(-21,-1).reduce((a,b)=>a+b,0) / 20; const last = closes[closes.length-1]; return last > sma20 ? 'bull' : last < sma20 ? 'bear' : 'neutral'; }
+function detectMSS(c){ if(!c || c.length < MSS_LOOKBACK + 5) return null; const start = Math.max(0, c.length - MSS_LOOKBACK); let swingHigh = -Infinity, swingLow = Infinity; for(let i=start;i<c.length;i++){ if(c[i].h > swingHigh) swingHigh = c[i].h; if(c[i].l < swingLow) swingLow = c[i].l; } const last = c[c.length-1]; if(last.h > swingHigh && last.c < last.o) return 'mss_bull_break'; if(last.l < swingLow && last.c > last.o) return 'mss_bear_break'; return null; }
+function detectLiquidityGrab(c){ if(!c || c.length < 20) return { top:false, bottom:false, atr:0, volOk:false }; const atr = ATR(c, 14); let swingHigh = -Infinity, swingLow = Infinity; const look = 20; for(let i=c.length - look; i < c.length; i++){ if(c[i].h > swingHigh) swingHigh = c[i].h; if(c[i].l < swingLow) swingLow = c[i].l; } const last = c[c.length-1]; const wickTop = last.h - Math.max(last.c, last.o); const wickBottom = Math.min(last.c, last.o) - last.l; const volOk = isVolumeSpike(c, VOLUME_MULT); const topSweep = (last.h > swingHigh) && (wickTop > atr * WICK_ATR_MULT) && (last.c < last.o) && volOk; const bottomSweep = (last.l < swingLow) && (wickBottom > atr * WICK_ATR_MULT) && (last.c > last.o) && volOk; return { top: topSweep, bottom: bottomSweep, atr, volOk }; }
+
+/* Main scan - 100% tumhara original logic */
+async function scanOnce(){
+  try{
+    const [m15, h1, h4] = await Promise.all([
+      getKlines('15m', LOOKBACK_M15),
+      getKlines('1h', LOOKBACK_1H),
+      getKlines('4h', LOOKBACK_4H)
+    ]);
+
+    if(!m15.length || m15.length < 40){
+      log('Not enough M15 data');
+      return;
+    }
+
+    const price = m15[m15.length-1].c;
+    const atr15 = ATR(m15,14);
+    const atrSMA = SMA_of_ATR_series(m15,14,20);
+    const atrShift = atrSMA ? (atr15 > atrSMA * ATR_INCREASE_MULT) : false;
+
+    const ob15 = detectOB(m15.slice(-80));
+    const ob1h = detectOB(h1.slice(-80));
+    const fvg = detectFVG(m15.slice(-30));
+    const volSpike = isVolumeSpike(m15);
+    const bias4h = trendBiasFrom4h(h4);
+    const mss = detectMSS(m15);
+    const liq = detectLiquidityGrab(m15);
+
+    const ind1 = !!(ob15.bull || ob15.bear);
+    const ind2 = !!(ob1h.bull || ob1h.bear);
+    const ind3 = !!fvg;
+    const ind4 = volSpike;
+    const ind5 = bias4h !== 'neutral';
+    const ind6 = atrShift;
+    const ind7 = !!mss;
+    const ind8 = (liq.top || liq.bottom) && liq.volOk;
+
+    const confirmed = [ind1,ind2,ind3,ind4,ind5,ind6,ind7,ind8].filter(x=>x).length;
+
+    let trend = 'NEUTRAL';
+    if(liq.top) trend = 'SELL';
+    else if(liq.bottom) trend = 'BUY';
+    else if(mss && mss.includes('bear')) trend = 'SELL';
+    else if(mss && mss.includes('bull')) trend = 'BUY';
+    else if(bias4h === 'bull') trend = 'BUY';
+    else if(bias4h === 'bear') trend = 'SELL';
+
+    let strengthLabel = 'Weak (' + confirmed + '/8)';
+    if(confirmed >= 6) strengthLabel = 'Strong (' + confirmed + '/8)';
+    else if(confirmed === 5) strengthLabel = 'Early (' + confirmed + '/8)';
+
+    trendChip.style.background = trend === 'BUY' ? 'var(--good)' : (trend === 'SELL' ? 'var(--bad)' : '#222');
+    trendChip.style.color = trend === 'NEUTRAL' ? 'var(--muted)' : 'white';
+    trendChip.innerText = 'Trend: ' + trend;
+
+    strengthChip.style.background = confirmed >= 6 ? 'var(--good)' : (confirmed === 5 ? '#d47a00' : '#222');
+    strengthChip.style.color = (confirmed >=5) ? 'white' : 'var(--muted)';
+    strengthChip.innerText = 'Strength: ' + strengthLabel;
+
+    log(
+`--------------------------
+Price: ${fmt(price, 2)}
+Confirmed: ${confirmed}/8
+Trend: ${trend}
+Strength: ${strengthLabel}
+OB 15m: \( {ind1} | OB 1h: \){ind2} | FVG: ${ind3}
+VolumeSpike: \( {ind4} | 4H Bias: \){bias4h}
+ATR Shift: \( {ind6} | MSS: \){mss || 'none'}
+Liquidity: top:\( {liq.top} bottom: \){liq.bottom}
+--------------------------`
+    );
+
+    if(Date.now() - lastSignalTime < COOLDOWN_MS){
+      if(confirmed >= 5) log('Signal blocked by cooldown');
+      return;
+    }
+
+    if(confirmed >= 5){
+      const strength = (confirmed === 5) ? 'EARLY SIGNAL (5/8)' : 'STRONG SIGNAL ('+confirmed+'/8)';
+      const direction = (trend === 'BUY') ? 'LONG' : 'SHORT';
+
+      const entry = price;
+      const slBuffer = Math.max(atr15 * 1.5, 5.0); // Gold ke liye thoda bada buffer
+      const sl = direction === 'LONG' ? entry - slBuffer : entry + slBuffer;
+      const tp = direction === 'LONG' ? entry + (entry - sl) * RR : entry - (sl - entry) * RR;
+
+      const tgMsg = [
+        '<b>XAUUSD NUCLEAR SMC vC — GOLD SIGNAL</b>',
+        strength,
+        '',
+        `<b>Direction:</b> ${direction}`,
+        `Entry: <b>${fmt(entry, 2)}</b>`,
+        `SL: <b>${fmt(sl, 2)}</b>`,
+        `TP: <b>${fmt(tp, 2)}</b>`,
+        '',
+        `<b>Confirmed:</b> ${confirmed}/8`,
+        `<b>Trend:</b> ${trend}`,
+        `<b>Strength:</b> ${strengthLabel}`,
+        `Time: ${new Date().toLocaleString()}`
+      ].join('\n');
+
+      await sendToTelegram(tgMsg);
+
+      lastSignalTime = Date.now();
+      lastSignalEl.innerText = 'Last Signal: ' + new Date().toLocaleTimeString();
+      signalBox.style.display = 'block';
+      signalBox.style.background = (direction === 'LONG') ? 'var(--good)' : 'var(--bad)';
+      signalBox.innerHTML = tgMsg.replace(/\n/g,'<br>');
+      log('SIGNAL SENT -> ' + direction + ' XAUUSD');
+    }
+
+  }catch(e){
+    log('Scan error: ' + e.message);
+  }
+}
+
+async function sendToTelegram(msgHtml){
+  const token = document.getElementById('tg_token').value.trim();
+  if(!token){ log('TG token not set'); return; }
+  const chatStr = document.getElementById('tg_chats').value.trim();
+  if(!chatStr){ log('No chat IDs'); return; }
+  const chatIds = chatStr.split(',').map(s=>s.trim()).filter(s=>s.length);
+  for(const id of chatIds){
+    const url = `https://api.telegram.org/bot\( {token}/sendMessage?chat_id= \){id}&text=${encodeURIComponent(msgHtml)}&parse_mode=HTML&disable_web_page_preview=true`;
+    try{
+      const res = await fetch(url);
+      const j = await res.json();
+      if(j.ok) log('Sent to ' + id);
+      else log('TG error: ' + JSON.stringify(j));
+    }catch(e){
+      log('TG send failed: ' + e.message);
+    }
+    await sleep(250);
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', ()=>{
+  const key = document.getElementById('td_key').value.trim();
+  if(!key || key.length < 10){
+    alert('Twelve Data API Key daal do bhai!\nFree key lo: https://twelvedata.com/apikey');
+    return;
+  }
+  if(running) return;
+  running = true;
+  statusEl.innerText = 'Status: Running';
+  log('XAUUSD NUCLEAR SMC Bot started (TwelveData)');
+  scanOnce();
+  loopId = setInterval(scanOnce, SCAN_MS);
+});
+
+document.getElementById('stopBtn').addEventListener('click', ()=>{
+  if(loopId) clearInterval(loopId);
+  running = false;
+  statusEl.innerText = 'Status: Stopped';
+  log('Bot stopped');
+});
+</script>
+</body>
+</html>
